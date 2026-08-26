@@ -1270,7 +1270,6 @@ def main():
         ApplicationBuilder()
         .token(TOKEN)
         .request(httpx_request)
-        .job_queue()
         .build()
     )
     application.add_handler(CONV)
