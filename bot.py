@@ -7,7 +7,10 @@ import random
 import sqlite3
 import asyncio
 import httpx
+import signal
+import sys
 from io import BytesIO
+from pathlib import Path
 
 import requests
 import feedparser
@@ -25,16 +28,36 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+from dotenv import load_dotenv
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("newsbot")
+load_dotenv()
 
-TOKEN = None  # Replace with your Telegram bot token
-OPENROUTER_API_KEY = None  # Replace with your OpenRouter API key
-OWNER_ID = None  # Replace with your Telegram user ID for owner commands
+def setup_logging():
+    log_file = os.getenv("LOG_FILE", "").strip()
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+        handlers=handlers,
+    )
+    return logging.getLogger("newsbot")
+
+log = setup_logging()
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) or None
+
+if not TOKEN:
+    log.error("TELEGRAM_BOT_TOKEN not set in environment")
+    sys.exit(1)
+if not OPENROUTER_API_KEY:
+    log.error("OPENROUTER_API_KEY not set in environment")
+    sys.exit(1)
+if not OWNER_ID:
+    log.warning("OWNER_ID not set - owner commands will not work")
 
 MODELS = [
     "minimax/minimax-m3:free",
@@ -50,9 +73,10 @@ MODELS = [
 ]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-CONFIG_FILE = "config.json"
-DB_FILE = "news.db"
-MAX_CHANNELS = 4
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+DB_FILE = os.getenv("DB_FILE", "news.db")
+MAX_CHANNELS = int(os.getenv("MAX_CHANNELS", "4"))
+DEFAULT_INTERVAL_MINUTES = int(os.getenv("DEFAULT_INTERVAL_MINUTES", "30"))
 
 SOURCES = [
     {"name": "BBC", "rss": "http://feeds.bbci.co.uk/news/rss.xml"},
@@ -174,14 +198,14 @@ def get_latest_posted():
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        return {"channels": [], "interval_minutes": 30, "paused": False}
+        return {"channels": [], "interval_minutes": DEFAULT_INTERVAL_MINUTES, "paused": False}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception:
-        return {"channels": [], "interval_minutes": 30, "paused": False}
+        return {"channels": [], "interval_minutes": DEFAULT_INTERVAL_MINUTES, "paused": False}
     cfg.setdefault("channels", [])
-    cfg.setdefault("interval_minutes", 30)
+    cfg.setdefault("interval_minutes", DEFAULT_INTERVAL_MINUTES)
     cfg.setdefault("paused", False)
     norm = []
     default_int = cfg["interval_minutes"]
@@ -425,8 +449,20 @@ def _ensure_bricolage():
     import glob
     import shutil
     try:
-        hits = glob.glob(r"C:\Windows\Fonts\*ricolage*.ttf") + \
-               glob.glob(r"C:\Windows\Fonts\*ricolage*.otf")
+        font_dirs = []
+        if sys.platform == "win32":
+            font_dirs.append(r"C:\Windows\Fonts")
+        else:
+            font_dirs.extend([
+                "/usr/share/fonts",
+                "/usr/local/share/fonts",
+                os.path.expanduser("~/.fonts"),
+                os.path.expanduser("~/.local/share/fonts"),
+            ])
+        hits = []
+        for font_dir in font_dirs:
+            hits.extend(glob.glob(os.path.join(font_dir, "*ricolage*.ttf")))
+            hits.extend(glob.glob(os.path.join(font_dir, "*ricolage*.otf")))
         if hits:
             os.makedirs(FONT_DIR, exist_ok=True)
             shutil.copy(hits[0], FONT_PATH)
@@ -1216,6 +1252,7 @@ CONV = ConversationHandler(
     ]},
     fallbacks=[CommandHandler("cancel", conv_cancel),
                CallbackQueryHandler(conv_cancel_cb, pattern="^cancel$")],
+    per_message=False,
 )
 
 
@@ -1233,6 +1270,7 @@ def main():
         ApplicationBuilder()
         .token(TOKEN)
         .request(httpx_request)
+        .job_queue()
         .build()
     )
     application.add_handler(CONV)
@@ -1251,7 +1289,15 @@ def main():
     application.add_handler(CommandHandler("pause", pause_cmd))
     application.add_handler(CommandHandler("resume", resume_cmd))
     application.add_handler(CommandHandler("news", news_cmd))
-    application.post_shutdown(_shutdown)
+    application.post_shutdown = _shutdown
+
+    def _signal_handler(signum, frame):
+        log.info("Received signal %s, shutting down...", signum)
+        application.create_task(application.shutdown())
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     cfg = load_config()
     schedule_jobs(application)
     log.info("bot starting with %d sources, %d channels", len(SOURCES), len(cfg["channels"]))
